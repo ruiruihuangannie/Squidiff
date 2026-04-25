@@ -6,6 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "Squidiff"
 version = "1.0.8"
 dependencies = [
+  "accelerate",
+  "wandb",
 ]
 requires-python = ">= 3.8"
 description = "Diffusion model-based generative framework designed to predict transcriptomic changes across diverse cell types in response to a wide range of environmental changes."

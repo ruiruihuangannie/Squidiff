@@ -1,119 +1,117 @@
 """
-Helpers for distributed training.
-This code is adapted from openai's guided-diffusion models:
-https://github.com/openai/guided-diffusion
+Helpers for Accelerate-backed multi-GPU training and checkpoint I/O.
 """
 
-import io
 import os
-import socket
 
 import torch as th
-import torch.distributed as dist
+from accelerate import Accelerator
 
 
-GPUS_PER_NODE = 1
+_ACCELERATOR = None
+_ACCELERATOR_CONFIG = None
 
-SETUP_RETRY_COUNT = 3
 
-
-def setup_dist():
+def setup_accelerator(*, use_fp16=False):
     """
-    Setup a distributed process group.
+    Create a singleton Accelerator instance for the current process.
     """
-    if dist.is_initialized():
-        return
+    global _ACCELERATOR, _ACCELERATOR_CONFIG
 
-    # Set default environment variables if not already set
-    if "RANK" not in os.environ:
-        print("Environment variable RANK not set. Setting default RANK=0")
-        os.environ["RANK"] = "0"
-    if "WORLD_SIZE" not in os.environ:
-        print("Environment variable WORLD_SIZE not set. Setting default WORLD_SIZE=1")
-        os.environ["WORLD_SIZE"] = "1"
-    if "MASTER_ADDR" not in os.environ:
-        print("Environment variable MASTER_ADDR not set. Setting default MASTER_ADDR='localhost'")
-        os.environ["MASTER_ADDR"] = "localhost"
-    if "MASTER_PORT" not in os.environ:
-        print("Environment variable MASTER_PORT not set. Setting default MASTER_PORT='12355'")
-        os.environ["MASTER_PORT"] = "12355"
+    mixed_precision = "fp16" if use_fp16 else "no"
+    requested_config = {"mixed_precision": mixed_precision}
 
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
+    if _ACCELERATOR is None:
+        _ACCELERATOR = Accelerator(**requested_config)
+        _ACCELERATOR_CONFIG = requested_config
+    elif _ACCELERATOR_CONFIG != requested_config:
+        raise RuntimeError(
+            "Accelerator has already been initialized with a different "
+            f"configuration: {_ACCELERATOR_CONFIG} != {requested_config}"
+        )
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = f"{rank % GPUS_PER_NODE}"
+    return _ACCELERATOR
 
-    backend = "gloo" if not th.cuda.is_available() else "nccl"
-    dist.init_process_group(backend=backend, init_method="env://")
+
+def accelerator():
+    """
+    Return the shared Accelerator instance, creating a default one if needed.
+    """
+    if _ACCELERATOR is None:
+        return setup_accelerator()
+    return _ACCELERATOR
 
 
 def dev():
     """
-    Get the device to use for torch.distributed.
+    Get the device managed by Accelerate.
     """
-    if th.cuda.is_available():
-        return th.device("cuda")
-    return th.device("cpu")
+    return accelerator().device
 
 
-def load_state_dict(path, **kwargs):
+def is_main_process():
+    return accelerator().is_main_process
+
+
+def num_processes():
+    return accelerator().num_processes
+
+
+def process_index():
+    return accelerator().process_index
+
+
+def prepare(*objects):
+    return accelerator().prepare(*objects)
+
+
+def unwrap_model(model):
+    return accelerator().unwrap_model(model)
+
+
+def backward(loss):
+    accelerator().backward(loss)
+
+
+def wait_for_everyone():
+    accelerator().wait_for_everyone()
+
+
+def reduce_tensor(tensor, reduction="mean"):
+    return accelerator().reduce(tensor, reduction=reduction)
+
+
+def gather_for_metrics(tensor):
+    return accelerator().gather_for_metrics(tensor)
+
+
+def pad_across_processes(tensor, dim=0, pad_index=0):
+    return accelerator().pad_across_processes(tensor, dim=dim, pad_index=pad_index)
+
+
+def save(obj, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    accelerator().save(obj, path)
+
+
+def load_state_dict(path, map_location="cpu", **kwargs):
     """
-    Load a PyTorch file without redundant fetches across ranks.
+    Load a PyTorch checkpoint from local storage.
     """
-    chunk_size = 2 ** 30  # Size limit for data chunks
+    state_dict = th.load(path, map_location=map_location, **kwargs)
 
-    if not dist.is_available() or not dist.is_initialized():
-        # Load directly if distributed training is not available or initialized
-        state_dict = th.load(path, **kwargs)
-    else:
-        if dist.get_rank() == 0:
-            with open(path, "rb") as f:
-                data = f.read()
-            num_chunks = len(data) // chunk_size
-            if len(data) % chunk_size:
-                num_chunks += 1
-            num_chunks_tensor = th.tensor([num_chunks], dtype=th.int64)
-            dist.broadcast(num_chunks_tensor, 0)
-            for i in range(0, len(data), chunk_size):
-                chunk = th.tensor(list(data[i:i + chunk_size]), dtype=th.uint8)
-                dist.broadcast(chunk, 0)
-        else:
-            num_chunks_tensor = th.tensor([0], dtype=th.int64)
-            dist.broadcast(num_chunks_tensor, 0)
-            num_chunks = num_chunks_tensor.item()
-            data = bytearray()
-            for _ in range(num_chunks):
-                chunk = th.zeros(chunk_size, dtype=th.uint8)
-                dist.broadcast(chunk, 0)
-                data.extend(chunk.tolist())
-
-        state_dict = th.load(io.BytesIO(data), **kwargs)
-
-    # Extract the model state dictionary if needed
-    if 'state_dict' in state_dict:
-        state_dict = state_dict['state_dict']
-    elif 'model' in state_dict:
-        state_dict = state_dict['model']
+    if isinstance(state_dict, dict):
+        if "state_dict" in state_dict:
+            return state_dict["state_dict"]
+        if "model" in state_dict:
+            return state_dict["model"]
 
     return state_dict
 
-def sync_params(params):
-    """
-    Synchronize a sequence of Tensors across ranks from rank 0.
-    """
-    for p in params:
-        with th.no_grad():
-            dist.broadcast(p, 0)
 
-
-def _find_free_port():
+def sync_params(_params):
     """
-    Find a free port for distributed training setup.
+    Retained for compatibility with older call sites.
+    Accelerate handles parameter synchronization when wrapping the model.
     """
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(("", 0))
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        return s.getsockname()[1]
-    finally:
-        s.close()
+    return

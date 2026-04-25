@@ -2,7 +2,8 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 import torch as th
-import torch.distributed as dist
+
+from . import dist_util
 
 
 def create_named_schedule_sampler(name, diffusion):
@@ -80,27 +81,8 @@ class LossAwareSampler(ScheduleSampler):
         :param local_ts: an integer Tensor of timesteps.
         :param local_losses: a 1D Tensor of losses.
         """
-        batch_sizes = [
-            th.tensor([0], dtype=th.int32, device=local_ts.device)
-            for _ in range(dist.get_world_size())
-        ]
-        dist.all_gather(
-            batch_sizes,
-            th.tensor([len(local_ts)], dtype=th.int32, device=local_ts.device),
-        )
-
-        # Pad all_gather batches to be the maximum batch size.
-        batch_sizes = [x.item() for x in batch_sizes]
-        max_bs = max(batch_sizes)
-
-        timestep_batches = [th.zeros(max_bs).to(local_ts) for bs in batch_sizes]
-        loss_batches = [th.zeros(max_bs).to(local_losses) for bs in batch_sizes]
-        dist.all_gather(timestep_batches, local_ts)
-        dist.all_gather(loss_batches, local_losses)
-        timesteps = [
-            x.item() for y, bs in zip(timestep_batches, batch_sizes) for x in y[:bs]
-        ]
-        losses = [x.item() for y, bs in zip(loss_batches, batch_sizes) for x in y[:bs]]
+        timesteps = dist_util.gather_for_metrics(local_ts.detach()).cpu().tolist()
+        losses = dist_util.gather_for_metrics(local_losses.detach()).cpu().tolist()
         self.update_with_all_losses(timesteps, losses)
 
     @abstractmethod
