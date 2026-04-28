@@ -4,12 +4,19 @@
 # @Last Modified time: 2026-04-19
 
 import argparse
-import os
 from datetime import datetime
 
+from Squidiff.config_util import (
+    load_config, 
+    normalize_training_config, 
+    training_defaults, 
+    validate_args
+)
 from Squidiff import dist_util, wandb_util
+from Squidiff.model_spec import build_model_spec
 from Squidiff.resample import create_named_schedule_sampler
 from Squidiff.scrna_datasets import prepared_data
+from Squidiff.seed_util import seed_everything
 from Squidiff.script_util import (
     args_to_dict,
     create_model_and_diffusion,
@@ -17,30 +24,43 @@ from Squidiff.script_util import (
 )
 from Squidiff.train_util import TrainLoop
 
-
-def _str2bool(value):
-    if isinstance(value, bool):
-        return value
-    value = value.lower()
-    if value in {"true", "1", "yes", "y"}:
-        return True
-    if value in {"false", "0", "no", "n"}:
-        return False
-    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
-
-
-def _arg_type(value):
-    if isinstance(value, bool):
-        return _str2bool
-    return type(value)
-
-
-def _default_checkpoint_dir():
-    return os.path.join("checkpoints", datetime.now().strftime("%Y%m%d_%H%M%S"))
-
-
 def run_training(args):
+    seed_everything(args["seed"])
     accelerator = dist_util.setup_accelerator(use_fp16=args["use_fp16"])
+
+    accelerator.print("creating data loader...")
+    data, resolved_spec = prepared_data(
+        data_path=args["data_path"],
+        control_data_dir=args["control_data_path"],
+        batch_size=args["batch_size"],
+        use_drug_structure=args["use_drug_structure"],
+        comb_num=args["comb_num"],
+        rna_only=args["rna_only"],
+        gene_size=args.get("gene_size"),
+        shuffle=True,
+    )
+    val_data = None
+    if args.get("val_data_path"):
+        accelerator.print("creating validation data loader...")
+        val_data, _ = prepared_data(
+            data_path=args["val_data_path"],
+            control_data_dir=args["control_data_path"],
+            batch_size=args["batch_size"],
+            use_drug_structure=args["use_drug_structure"],
+            comb_num=args["comb_num"],
+            rna_only=args["rna_only"],
+            gene_size=None,
+            rna_feature_names=resolved_spec.rna_feature_names,
+            atac_feature_names=resolved_spec.atac_feature_names,
+            shuffle=False,
+        )
+    args["gene_size"] = resolved_spec.rna_dim
+    args["atac_input_size"] = resolved_spec.atac_dim
+    args["rna_feature_names"] = resolved_spec.rna_feature_names
+    args["rna_features_file"] = "rna_features.txt"
+    args["atac_feature_names"] = resolved_spec.atac_feature_names
+    args["atac_features_file"] = "atac_features.txt"
+    args["model_spec"] = build_model_spec(args)
     wandb_util.init_run(args)
 
     accelerator.print("creating model and diffusion...")
@@ -48,15 +68,6 @@ def run_training(args):
         **args_to_dict(args, model_and_diffusion_defaults().keys())
     )
     schedule_sampler = create_named_schedule_sampler(args["schedule_sampler"], diffusion)
-
-    accelerator.print("creating data loader...")
-    data = prepared_data(
-        data_dir=args["data_path"],
-        control_data_dir=args["control_data_path"],
-        batch_size=args["batch_size"],
-        use_drug_structure=args["use_drug_structure"],
-        comb_num=args["comb_num"],
-    )
 
     start_time = datetime.now()
     accelerator.print(f"training started at {start_time.isoformat()}")
@@ -87,6 +98,14 @@ def run_training(args):
         lr_anneal_steps=args["lr_anneal_steps"],
         use_drug_structure=args["use_drug_structure"],
         comb_num=args["comb_num"],
+        model_spec=args["model_spec"],
+        rna_feature_names=resolved_spec.rna_feature_names,
+        rna_features_file=args["rna_features_file"],
+        atac_feature_names=resolved_spec.atac_feature_names,
+        atac_features_file=args["atac_features_file"],
+        val_data=val_data,
+        use_ddim=args["use_ddim"],
+        val_recon_interval_epochs=args["val_recon_interval_epochs"],
     )
     train_.run_loop()
 
@@ -96,7 +115,6 @@ def run_training(args):
     accelerator.print(
         f"training finished at {end_time.isoformat()} after {duration_min:.2f} minutes"
     )
-    wandb_util.log({"train_duration_min": duration_min}, step=final_step)
     wandb_util.update_summary(
         {
             "train_end": end_time.isoformat(),
@@ -110,66 +128,42 @@ def run_training(args):
 
 
 def parse_args():
-    """Parse command-line arguments and update with default values."""
-    default_args = {}
-    default_args.update(model_and_diffusion_defaults())
-    updated_args = {
-        "data_path": "",
-        "control_data_path": "",
-        "schedule_sampler": "uniform",
-        "lr": 1e-4,
-        "weight_decay": 0.0,
-        "lr_anneal_steps": 1e5,
-        "batch_size": 128,
-        "microbatch": -1,
-        "ema_rate": "0.9999",
-        "log_interval": 1e4,
-        "save_interval": 1e4,
-        "resume_checkpoint": "",
-        "use_fp16": False,
-        "fp16_scale_growth": 1e-3,
-        "gene_size": 100,
-        "output_dim": 100,
-        "num_layers": 3,
-        "class_cond": False,
-        "use_encoder": True,
-        "diffusion_steps": 1000,
-        "logger_path": "",
-        "wandb_project": "Squidiff",
-        "wandb_run_name": "",
-        "wandb_entity": "",
-        "wandb_mode": "online",
-        "wandb_dir": "",
-        "use_drug_structure": False,
-        "comb_num": 1,
-        "use_ddim": True,
-    }
-    default_args.update(updated_args)
-
+    """Parse command-line arguments from YAML plus a few optional overrides."""
     parser = argparse.ArgumentParser(
         description="Perturbation-conditioned generative diffusion model"
     )
-    for key, value in default_args.items():
-        parser.add_argument(
-            f"--{key}",
-            default=value,
-            type=_arg_type(value),
-            help=f"{key} (default: {value})",
-        )
+    parser.add_argument("--config", required=True, help="Path to YAML training config.")
+    parser.add_argument("--seed", type=int, default=None, help="Optional seed override.")
+    parser.add_argument("--data_path", default=None, help="Optional dataset path override.")
+    parser.add_argument("--val_data_path", default=None, help="Optional validation dataset path override.")
+    parser.add_argument(
+        "--rna_only",
+        default=None,
+        choices=["true", "false", "True", "False"],
+        help="Required modality mode override.",
+    )
+    parser.add_argument(
+        "--resume_checkpoint",
+        default=None,
+        help="Optional checkpoint directory override.",
+    )
 
-    args = vars(parser.parse_args())
-    if args["data_path"] == "":
-        raise ValueError(
-            "Dataset path is required. Please specify the path where the training adata is."
-        )
+    cli_args = parser.parse_args()
+    config = load_config(cli_args.config)
+    args = normalize_training_config(config, training_defaults())
 
-    if not args["wandb_dir"] and args["logger_path"]:
-        args["wandb_dir"] = args["logger_path"]
+    overrides = {
+        "seed": cli_args.seed,
+        "data_path": cli_args.data_path,
+        "val_data_path": cli_args.val_data_path,
+        "rna_only": None if cli_args.rna_only is None else cli_args.rna_only.lower() == "true",
+        "resume_checkpoint": cli_args.resume_checkpoint,
+    }
+    for key, value in overrides.items():
+        if value is not None:
+            args[key] = value
 
-    if not args["resume_checkpoint"]:
-        args["resume_checkpoint"] = _default_checkpoint_dir()
-
-    return args
+    return validate_args(args)
 
 
 def main():

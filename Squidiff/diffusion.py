@@ -116,12 +116,20 @@ class GaussianDiffusion:
         loss_type,
         rescale_timesteps=False,
         use_encoder=False,
+        use_kl_loss=False,
+        kl_weight=0.0,
+        use_gmm_loss=False,
+        gmm_weight=0.0,
     ):
         self.use_encoder = use_encoder
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
         self.loss_type = loss_type
         self.rescale_timesteps = rescale_timesteps
+        self.use_kl_loss = use_kl_loss
+        self.kl_weight = float(kl_weight)
+        self.use_gmm_loss = use_gmm_loss
+        self.gmm_weight = float(gmm_weight)
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -748,6 +756,8 @@ The resulting units are bits (rather than nats, as one might expect).
         """
         if model_kwargs is None:
             model_kwargs = {}
+        else:
+            model_kwargs = dict(model_kwargs)
         if noise is None:
             noise = th.randn_like(x_start)
        
@@ -771,6 +781,16 @@ The resulting units are bits (rather than nats, as one might expect).
         #elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
         ## loss = MSE
         else:
+            z_sem = None
+            if self.use_gmm_loss:
+                model_module = getattr(model, "model", model)
+                model_module = getattr(model_module, "module", model_module)
+                if not hasattr(model_module, "encode_condition") or not hasattr(
+                    model_module, "gmm_nll"
+                ):
+                    raise ValueError("loss_type='mse-gmm' requires a model with encode_condition and gmm_nll.")
+                z_sem = model_module.encode_condition(model_kwargs)
+                model_kwargs["z_mod"] = z_sem
             model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
 
             if self.model_var_type in [
@@ -804,10 +824,25 @@ The resulting units are bits (rather than nats, as one might expect).
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
             terms["mse"] = mean_flat((target - model_output) ** 2)
+            if self.use_kl_loss:
+                terms["kl"] = self._vb_terms_bpd(
+                    model=model,
+                    x_start=x_start,
+                    x_t=x_t,
+                    t=t,
+                    clip_denoised=False,
+                    model_kwargs=model_kwargs,
+                )["output"]
+            if self.use_gmm_loss:
+                terms["gmm_nll"] = model_module.gmm_nll(z_sem)
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:
                 terms["loss"] = terms["mse"]
+            if "kl" in terms:
+                terms["loss"] = terms["loss"] + self.kl_weight * terms["kl"]
+            if "gmm_nll" in terms:
+                terms["loss"] = terms["loss"] + self.gmm_weight * terms["gmm_nll"]
 
         
         return terms

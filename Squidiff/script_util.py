@@ -17,10 +17,10 @@ def diffusion_defaults():
         diffusion_steps=1000,
         noise_schedule="linear",
         timestep_respacing="",
-        use_kl=False,
+        loss_type="mse",
+        alpha=0.1,
         predict_xstart=False,
         rescale_timesteps=False,
-        rescale_learned_sigmas=False,
     )
 
 
@@ -44,9 +44,8 @@ def model_and_diffusion_defaults():
     Defaults for training.
     """
     res = dict(
-        output_dim=1000,
         num_layers=3,
-        gene_size=1000,
+        gene_size=None,
         num_channels=128,
         dropout=0.0,
         class_cond=False,
@@ -57,6 +56,12 @@ def model_and_diffusion_defaults():
         use_drug_structure=False,
         drug_dimension=1024,
         comb_num=1,
+        atac_input_size=None,
+        paired_latent_dim=128,
+        hidden_rna="1024,512",
+        hidden_atac="1024,512",
+        paired_dropout=0.2,
+        gmm_num_components=16,
     )
     res.update(diffusion_defaults())
     return res
@@ -71,7 +76,6 @@ def classifier_and_diffusion_defaults():
 def create_model_and_diffusion(
     gene_size,
     num_layers,
-    output_dim,
     class_cond,
     learn_sigma,
     num_channels,
@@ -79,10 +83,10 @@ def create_model_and_diffusion(
     diffusion_steps,
     noise_schedule,
     timestep_respacing,
-    use_kl,
+    loss_type,
+    alpha,
     predict_xstart,
     rescale_timesteps,
-    rescale_learned_sigmas,
     use_checkpoint,
     use_scale_shift_norm,
     use_fp16,
@@ -90,11 +94,17 @@ def create_model_and_diffusion(
     use_drug_structure,
     drug_dimension,
     comb_num,
+    atac_input_size,
+    paired_latent_dim,
+    hidden_rna,
+    hidden_atac,
+    paired_dropout,
+    gmm_num_components,
 ):
     model = create_model(
         gene_size,
         num_layers,
-        output_dim,
+        loss_type=loss_type,
         learn_sigma=learn_sigma,
         class_cond=class_cond,
         use_checkpoint=use_checkpoint,
@@ -105,15 +115,21 @@ def create_model_and_diffusion(
         use_drug_structure = use_drug_structure,
         drug_dimension = drug_dimension,
         comb_num=comb_num,
+        atac_input_size=atac_input_size,
+        paired_latent_dim=paired_latent_dim,
+        hidden_rna=hidden_rna,
+        hidden_atac=hidden_atac,
+        paired_dropout=paired_dropout,
+        gmm_num_components=gmm_num_components,
     )
     diffusion = create_gaussian_diffusion(
         steps=diffusion_steps,
         learn_sigma=learn_sigma,
         noise_schedule=noise_schedule,
-        use_kl=use_kl,
+        loss_type=loss_type,
+        alpha=alpha,
         predict_xstart=predict_xstart,
         rescale_timesteps=rescale_timesteps,
-        rescale_learned_sigmas=rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
         use_encoder=use_encoder
     )
@@ -123,7 +139,7 @@ def create_model_and_diffusion(
 def create_model(
     gene_size,
     num_layers,
-    output_dim,
+    loss_type="mse",
     learn_sigma=False,
     class_cond=False,
     use_checkpoint=False,
@@ -134,12 +150,22 @@ def create_model(
     use_drug_structure = False,
     drug_dimension = 1024,
     comb_num=1,
+    atac_input_size=None,
+    paired_latent_dim=128,
+    hidden_rna="1024,512",
+    hidden_atac="1024,512",
+    paired_dropout=0.2,
+    gmm_num_components=16,
 ):
+    if isinstance(hidden_rna, str):
+        hidden_rna = tuple(int(part) for part in hidden_rna.split(",") if part)
+    if isinstance(hidden_atac, str):
+        hidden_atac = tuple(int(part) for part in hidden_atac.split(",") if part)
 
     return MLPModel(
         gene_size  = gene_size,
-        output_dim = output_dim,
         num_layers = num_layers,
+        loss_type=loss_type,
         dropout=dropout,
         num_classes=(NUM_CLASSES if class_cond else None),
         use_checkpoint=use_checkpoint,
@@ -149,68 +175,12 @@ def create_model(
         use_drug_structure = use_drug_structure,
         drug_dimension = drug_dimension,
         comb_num=comb_num,
-    )
-
-
-def create_classifier_and_diffusion(
-    gene_size,
-    classifier_use_fp16,
-    classifier_width,
-    classifier_depth,
-    classifier_use_scale_shift_norm,
-    classifier_pool,
-    learn_sigma,
-    diffusion_steps,
-    noise_schedule,
-    timestep_respacing,
-    use_kl,
-    predict_xstart,
-    rescale_timesteps,
-    rescale_learned_sigmas,
-    use_encoder,
-):
-    classifier = create_classifier(
-        gene_size,
-        classifier_use_fp16,
-        classifier_width,
-        classifier_depth,
-        classifier_use_scale_shift_norm,
-        classifier_pool,
-    )
-    diffusion = create_gaussian_diffusion(
-        steps=diffusion_steps,
-        learn_sigma=learn_sigma,
-        noise_schedule=noise_schedule,
-        use_kl=use_kl,
-        predict_xstart=predict_xstart,
-        rescale_timesteps=rescale_timesteps,
-        rescale_learned_sigmas=rescale_learned_sigmas,
-        timestep_respacing=timestep_respacing,
-        use_encoder=use_encoder
-    )
-    return classifier, diffusion
-
-
-def create_classifier(
-    gene_sizes,
-    classifier_use_fp16,
-    classifier_width,
-    classifier_depth,
-    classifier_use_scale_shift_norm,
-    classifier_pool,
-):
-
-
-    return EncoderUNetModel(
-        gene_size=gene_size,
-        in_channels=3,
-        model_channels=classifier_width,
-        out_channels=1000,
-        num_res_blocks=classifier_depth,
-        use_fp16=classifier_use_fp16,
-        num_head_channels=64,
-        use_scale_shift_norm=classifier_use_scale_shift_norm,
-        pool=classifier_pool,
+        atac_input_size=atac_input_size,
+        paired_latent_dim=paired_latent_dim,
+        hidden_rna=hidden_rna,
+        hidden_atac=hidden_atac,
+        paired_dropout=paired_dropout,
+        gmm_num_components=gmm_num_components,
     )
 
 
@@ -225,116 +195,42 @@ def sr_model_and_diffusion_defaults():
     return res
 
 
-def sr_create_model_and_diffusion(
-    large_size,
-    small_size,
-    class_cond,
-    learn_sigma,
-    num_channels,
-    num_res_blocks,
-    num_heads,
-    num_head_channels,
-    num_heads_upsample,
-    dropout,
-    diffusion_steps,
-    noise_schedule,
-    timestep_respacing,
-    use_kl,
-    predict_xstart,
-    rescale_timesteps,
-    rescale_learned_sigmas,
-    use_checkpoint,
-    use_scale_shift_norm,
-    use_fp16,
-):
-    model = sr_create_model(
-        large_size,
-        small_size,
-        num_channels,
-        num_res_blocks,
-        learn_sigma=learn_sigma,
-        class_cond=class_cond,
-        use_checkpoint=use_checkpoint,
-        num_heads=num_heads,
-        num_head_channels=num_head_channels,
-        num_heads_upsample=num_heads_upsample,
-        use_scale_shift_norm=use_scale_shift_norm,
-        dropout=dropout,
-        use_fp16=use_fp16,
-        use_encoder=use_encoder,
-    )
-    diffusion = create_gaussian_diffusion(
-        steps=diffusion_steps,
-        learn_sigma=learn_sigma,
-        noise_schedule=noise_schedule,
-        use_kl=use_kl,
-        predict_xstart=predict_xstart,
-        rescale_timesteps=rescale_timesteps,
-        rescale_learned_sigmas=rescale_learned_sigmas,
-        timestep_respacing=timestep_respacing,
-        use_encoder=use_encoder
-    )
-    return model, diffusion
-
-
-def sr_create_model(
-    large_size,
-    small_size,
-    num_channels,
-    num_res_blocks,
-    learn_sigma,
-    class_cond,
-    use_checkpoint,
-    num_heads,
-    num_head_channels,
-    num_heads_upsample,
-    use_scale_shift_norm,
-    dropout,
-    use_fp16,
-    use_encoder
-):
-    _ = small_size  # hack to prevent unused variable
-
-
-    return SuperResModel(
-        gene_size=large_size,
-        in_channels=3,
-        model_channels=num_channels,
-        out_channels=(3 if not learn_sigma else 6),
-        num_res_blocks=num_res_blocks,
-        dropout=dropout,
-        num_classes=(NUM_CLASSES if class_cond else None),
-        use_checkpoint=use_checkpoint,
-        num_heads=num_heads,
-        num_head_channels=num_head_channels,
-        num_heads_upsample=num_heads_upsample,
-        use_scale_shift_norm=use_scale_shift_norm,
-        use_fp16=use_fp16,
-        use_encoder = use_encoder
-    )
-
-
 def create_gaussian_diffusion(
     *,
     steps=1000,
     learn_sigma=False,
     sigma_small=False,
     noise_schedule="linear",
-    use_kl=False,
+    loss_type="mse",
+    alpha=0.1,
     predict_xstart=False,
     rescale_timesteps=False,
-    rescale_learned_sigmas=False,
     timestep_respacing="",
     use_encoder = False
 ):
     print('diffusion num of steps = ',steps)
     betas = diffusion.get_named_beta_schedule(noise_schedule, steps)
-    if use_kl:
-        loss_type = diffusion.LossType.RESCALED_KL
-    elif rescale_learned_sigmas:
-        loss_type = diffusion.LossType.RESCALED_MSE
+    use_gmm_loss = False
+    if loss_type == "mse":
+        diffusion_loss_type = diffusion.LossType.MSE
+        use_kl_loss = False
+    elif loss_type == "mse-kl":
+        diffusion_loss_type = diffusion.LossType.MSE
+        use_kl_loss = True
+    elif loss_type == "mse-gmm":
+        diffusion_loss_type = diffusion.LossType.MSE
+        use_kl_loss = False
+        use_gmm_loss = True
+    elif loss_type == "kl":
+        diffusion_loss_type = diffusion.LossType.KL
+        use_kl_loss = False
+    elif loss_type == "rescaled-mse":
+        diffusion_loss_type = diffusion.LossType.RESCALED_MSE
+        use_kl_loss = False
     else:
-        loss_type = diffusion.LossType.MSE
+        raise ValueError(
+            "loss_type must be one of: kl, mse, mse-kl, mse-gmm, rescaled-mse."
+        )
     if not timestep_respacing:
         timestep_respacing = [steps]
         
@@ -353,9 +249,13 @@ def create_gaussian_diffusion(
             if not learn_sigma
             else diffusion.ModelVarType.LEARNED_RANGE
         ),
-        loss_type=loss_type,
+        loss_type=diffusion_loss_type,
         rescale_timesteps=rescale_timesteps,
-        use_encoder=use_encoder
+        use_encoder=use_encoder,
+        use_kl_loss=use_kl_loss,
+        kl_weight=alpha,
+        use_gmm_loss=use_gmm_loss,
+        gmm_weight=alpha,
     )
 
 

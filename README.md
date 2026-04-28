@@ -8,10 +8,9 @@ Squidiff is a diffusion model-based generative framework designed to predict tra
 `pip install Squidiff`
 
 ### Model Input:
-h5ad file with info: 
-- Single-cell count matrix
-- Meta data
-- (optional) additional drug compounds
+- `.h5ad`: RNA-only input
+- `.h5mu`: MuData multiomics input accessed via `mdata['rna']` and `mdata['atac']`
+- `control_data_path` remains a separate RNA `.h5ad` when drug-structure conditioning is used
 
 ### Features 
 - Predicting single-cell transcriptomics upon drug treatments 
@@ -20,26 +19,29 @@ h5ad file with info:
 
 ### Training Squidiff
 ```
-accelerate launch --multi_gpu train_squidiff.py --wandb_project Squidiff --wandb_run_name your-run --wandb_dir wandb_logs --data_path YOUR_ADATASET.h5ad --resume_checkpoint checkpoints/your-run --gene_size 500 --output_dim 500
+python -m Squidiff.train_squidiff --config config/rna.yaml
+python -m Squidiff.train_squidiff --config config/rna-atac.yaml
 ```
 For incorporating drug structure in training, see the example: 
 ```
-accelerate launch --multi_gpu train_squidiff.py --wandb_project Squidiff --wandb_run_name sciplex-random-split-0 --wandb_dir wandb_logs --data_path datasets/sci_plex_train_random_split_0.h5ad --resume_checkpoint sciplex_results_random_split_0 --use_drug_structure True --gene_size 200 --output_dim 200 --control_data_path datasets/sci_plex_train_random_split_0_control.h5ad
+python -m Squidiff.train_squidiff --config path/to/config.yaml --data_path datasets/sci_plex_train_random_split_0.h5ad
 ```
 ### Sample Squidiff
 ```python
 sampler = sample_squidiff.sampler(
-    model_path = 'simu_results/model.pt',
-    gene_size = 100,
-    output_dim = 100,
-    use_drug_structure = False
+    model_path='simu_results/model.pt'
 )
 
 test_adata_scrna = sc.read_h5ad('datasets/sc_simu_test.h5ad')
+test_adata_scrna = sampler.align_rna_adata(test_adata_scrna)
 z_sem_scrna = sampler.model.encoder(torch.tensor(test_adata_scrna.X).to('cuda'))
 
-scrnas_pred = sampler.pred(z_sem_scrna, gene_size = test_adata_scrna.shape[1])
+scrnas_pred = sampler.pred(z_sem_scrna)
 ```
+`gene_size` is fixed by the checkpoint metadata. Do not pass the current dataset
+dimension into `sampler.pred()`; align evaluation RNA features with
+`sampler.align_rna_adata()` first.
+
 For multi-GPU sampling, launch your own inference script with `accelerate launch --multi_gpu ...`; the batch-based sampler methods such as `pred()` will shard work across processes and gather the outputs back.
 
 ### Demo

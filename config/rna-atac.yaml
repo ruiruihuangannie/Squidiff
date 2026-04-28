@@ -1,0 +1,15 @@
+__base__:
+  - config/base.yaml
+
+experiment:
+  run_name: squidiff-rna-atac
+
+dataset:
+  data_path: data/mouse/processed/mouse_train.h5mu
+  val_data_path: data/mouse/processed/mouse_val.h5mu
+  rna_only: False
+
+model:
+  gene_size: 100
+  loss_type: "mse"
+  

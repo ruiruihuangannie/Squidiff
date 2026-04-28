@@ -1,0 +1,47 @@
+experiment:
+  project_name: Squidiff
+  seed: 42
+
+training:
+  batch_size: 128
+  microbatch: -1
+  lr: 1.0e-4
+  weight_decay: 0.0
+  lr_anneal_steps: 100000
+  ema_rate: "0.9999"
+  log_interval: 10000
+  save_interval: 10000
+  resume_checkpoint: ""
+
+runtime:
+  use_fp16: false
+  fp16_scale_growth: 0.001
+  schedule_sampler: uniform
+  use_ddim: true
+
+model:
+  num_layers: 3
+  num_channels: 128
+  dropout: 0.0
+  class_cond: false
+  use_checkpoint: false
+  use_scale_shift_norm: true
+  use_encoder: true
+  loss_type: "mse"
+
+diffusion:
+  learn_sigma: false
+  diffusion_steps: 1000
+  noise_schedule: linear
+  timestep_respacing: ""
+  predict_xstart: false
+  rescale_timesteps: false
+
+conditioning:
+  use_drug_structure: false
+  comb_num: 1
+  drug_dimension: 1024
+  paired_latent_dim: 128
+  hidden_rna: [1024, 512]
+  hidden_atac: [1024, 512]
+  paired_dropout: 0.2

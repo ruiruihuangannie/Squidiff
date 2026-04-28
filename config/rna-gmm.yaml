@@ -1,0 +1,18 @@
+__base__:
+  - config/base.yaml
+
+experiment:
+  run_name: rna-gmm-0.01
+
+dataset:
+  data_path: data/mouse/processed/mouse_train.h5mu
+  val_data_path: data/mouse/processed/mouse_val.h5mu
+  rna_only: True
+
+model:
+  gene_size: 100
+  loss_type: 'mse-gmm'
+  alpha: 0.01
+  gmm_num_components: 16
+
+# python3 train_squidiff.py --config config/rna-gmm.yaml

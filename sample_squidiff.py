@@ -5,6 +5,12 @@
 import numpy as np
 import torch
 from Squidiff import dist_util
+from Squidiff.model_spec import (
+    load_atac_features,
+    load_model_spec,
+    load_rna_features,
+)
+from Squidiff.seed_util import seed_everything
 from Squidiff.script_util import (
     model_and_diffusion_defaults,
     create_model_and_diffusion,
@@ -15,8 +21,9 @@ import scipy
 
 
 class sampler:
-    def __init__(self,model_path,gene_size,output_dim,use_drug_structure):
-        args = self.parse_args(model_path,gene_size,output_dim,use_drug_structure)
+    def __init__(self, model_path, seed=42):
+        args = self.parse_args(model_path, seed)
+        seed_everything(args["seed"])
         self.accelerator = dist_util.setup_accelerator(use_fp16=args["use_fp16"])
         self.accelerator.print("load model and diffusion...")
 
@@ -33,6 +40,16 @@ class sampler:
         model.eval()
         self.model = model
         self.arg = args
+        self.rna_features = load_rna_features(
+            model_path,
+            filename=args.get("rna_features_file"),
+        )
+        self.atac_features = None
+        if args.get("atac_input_size") is not None:
+            self.atac_features = load_atac_features(
+                model_path,
+                filename=args.get("atac_features_file"),
+            )
         self.diffusion = diffusion
         self.sample_fn = (diffusion.p_sample_loop if not args['use_ddim'] else diffusion.ddim_sample_loop)
         self.num_processes = dist_util.num_processes()
@@ -152,42 +169,45 @@ class sampler:
 
         return self._run_distributed_batch(x, _encode, model_kwargs=model_kwargs)
 
-    def parse_args(self,model_path,gene_size,output_dim,use_drug_structure):
-        """Parse command-line arguments and update with default values."""
-        # Define default arguments
-        default_args = {}
-        default_args.update(model_and_diffusion_defaults())
-        updated_args = {
-            'data_path': '',
-            'schedule_sampler': 'uniform',
-            'lr': 1e-4,
-            'weight_decay': 0.0,
-            'lr_anneal_steps': 1e5,
-            'batch_size': 16,
-            'microbatch': -1,
-            'ema_rate': '0.9999',
-            'log_interval': 1e4,
-            'save_interval': 1e4,
-            'resume_checkpoint': '',
-            'use_fp16': False,
-            'fp16_scale_growth': 1e-3,
-            'gene_size': gene_size,
-            'output_dim': output_dim,
-            'num_layers': 3,
-            'class_cond': False,
-            'use_encoder': True,
-            'use_ddim':True,
-            'diffusion_steps': 1000,
-            'logger_path': '',
-            'model_path': model_path,
-            'use_drug_structure':use_drug_structure,
-            'comb_num':1,
-            'drug_dimension':1024
-        }
-        default_args.update(updated_args)
+    def parse_args(self, model_path, seed):
+        args = {}
+        args.update(model_and_diffusion_defaults())
+        args.update(load_model_spec(model_path))
+        args["model_path"] = model_path
+        args["seed"] = seed
+        return args
 
-        # Return the updated arguments as a dictionary
-        return default_args
+    def align_rna_adata(self, adata):
+        missing = [name for name in self.rna_features if name not in adata.var_names]
+        if missing:
+            raise ValueError(
+                "Evaluation RNA data is missing genes required by the checkpoint: "
+                + ", ".join(missing[:10])
+                + ("..." if len(missing) > 10 else "")
+            )
+        aligned = adata[:, self.rna_features].copy()
+        if aligned.n_vars != len(self.rna_features):
+            raise ValueError(
+                "Aligned RNA feature dimension does not match saved checkpoint metadata."
+            )
+        return aligned
+
+    def align_atac_adata(self, adata):
+        if self.atac_features is None:
+            raise ValueError("This checkpoint does not use ATAC features.")
+        missing = [name for name in self.atac_features if name not in adata.var_names]
+        if missing:
+            raise ValueError(
+                "Evaluation ATAC data is missing features required by the checkpoint: "
+                + ", ".join(missing[:10])
+                + ("..." if len(missing) > 10 else "")
+            )
+        aligned = adata[:, self.atac_features].copy()
+        if aligned.n_vars != len(self.atac_features):
+            raise ValueError(
+                "Aligned ATAC feature dimension does not match saved checkpoint metadata."
+            )
+        return aligned
 
     def load_squidiff_model(self):
         self.accelerator.print("load model and diffusion...")
@@ -198,6 +218,10 @@ class sampler:
         return self.sample_fn
 
     def get_diffused_data(self,model, x, t, model_kwargs):
+        max_t = int(t)
+        if max_t < 0:
+            raise ValueError("t must be non-negative.")
+
         def _diffuse(local_x, _local_kwargs, *, empty_batch):
             if empty_batch:
                 empty_t = x[:0]
@@ -208,18 +232,18 @@ class sampler:
                     "T": [],
                 }
 
+            noise = torch.randn_like(local_x)
             sample = local_x
             sample_t = [local_x]
-            xstart_t = []
+            xstart_t = [local_x]
             timesteps = []
 
-            for i in range(t):
+            for i in range(max_t + 1):
                 timestep = torch.full((local_x.shape[0],), i, device=dist_util.dev()).long()
                 with torch.no_grad():
-                    noise = torch.randn_like(sample)
-                    sample = sample + noise * (i / t)
+                    sample = self.diffusion.q_sample(local_x, timestep, noise=noise)
                     sample_t.append(sample)
-                    xstart_t.append(sample)
+                    xstart_t.append(local_x)
                     timesteps.append(timestep)
 
             return {
@@ -234,7 +258,21 @@ class sampler:
     def sample_around_point(self, point, num_samples=None, scale=0.7):
         return point + scale * np.random.randn(num_samples, point.shape[0])
 
-    def pred(self,z_sem, gene_size):
+    def _resolve_gene_size(self, gene_size):
+        checkpoint_gene_size = self.arg["gene_size"]
+        if gene_size is None:
+            return checkpoint_gene_size
+        if int(gene_size) != int(checkpoint_gene_size):
+            raise ValueError(
+                f"Requested gene_size={gene_size}, but checkpoint gene_size is "
+                f"{checkpoint_gene_size}. Align evaluation data with "
+                "`sampler.align_rna_adata()` and call `sampler.pred(z_sem)` "
+                "without overriding gene_size."
+            )
+        return checkpoint_gene_size
+
+    def pred(self, z_sem, gene_size=None):
+        gene_size = self._resolve_gene_size(gene_size)
         def _pred(local_z_sem, _local_kwargs, *, empty_batch):
             if empty_batch:
                 return z_sem.new_empty((0, gene_size))
@@ -249,6 +287,7 @@ class sampler:
         return self._run_distributed_batch(z_sem, _pred)
     
     def interp_with_direction(self, z_sem_origin = None, gene_size = None, direction = None, scale = 1, add_noise_term = True):
+        gene_size = self._resolve_gene_size(gene_size)
 
         z_sem_origin = z_sem_origin.detach().cpu().numpy()
         z_sem_interp_ = z_sem_origin.mean(axis=0) + direction.detach().cpu().numpy() * scale
@@ -259,10 +298,10 @@ class sampler:
         return self.pred(z_sem_interp_, gene_size)
         
     def cal_metric(self,x1,x2):
-        r2 = r2_score(x1.detach().cpu().numpy().mean(axis=0),
-                      x2.X.mean(axis=0))
-        pearsonr,_ = scipy.stats.pearsonr(x1.detach().cpu().numpy().mean(axis=0),
-                      x2.X.mean(axis=0))
+        pred_mean = np.asarray(x1.detach().cpu().numpy().mean(axis=0)).ravel()
+        true_mean = np.asarray(x2.X.mean(axis=0)).ravel()
+        r2 = r2_score(pred_mean, true_mean)
+        pearsonr,_ = scipy.stats.pearsonr(pred_mean, true_mean)
         return r2, pearsonr
 
         
